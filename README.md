@@ -1,7 +1,6 @@
 # Thermal Emergency Manager
 
-Thermal Emergency Manager (TEM) is repository 32 of the Data Center Control Plane
-(DCCP) program. It owns facility thermal-emergency coordination: the authoritative
+Thermal Emergency Manager (TEM) owns facility thermal-emergency coordination: the authoritative
 emergency state during a thermal excursion, the bounded cross-domain mitigations
 that must be requested, the protected obligations that constrain those requests,
 the conditions under which escalation must continue, and the current evidence
