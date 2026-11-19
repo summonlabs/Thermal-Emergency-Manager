@@ -2,10 +2,12 @@
 // Copyright 2026 Summon Software Labs.
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "framework.hpp"
@@ -403,6 +405,65 @@ TEM_TEST(restored_observations_are_not_current_evidence_until_revalidated) {
   const ReadModel refreshed = reopened.value()->Inspect(later);
   TEM_CHECK(refreshed.evidence.all_fresh);
   TEM_CHECK(refreshed.severity == before.severity);
+  reopened.value()->Shutdown();
+}
+
+TEM_TEST(a_commit_waits_for_a_reader_of_the_slot_it_replaces) {
+  TempDir dir("slot-reader");
+  auto opened_runtime = open_durable(dir.path());
+  TEM_REQUIRE(opened_runtime.ok());
+  std::unique_ptr<EmergencyRuntime> runtime = std::move(opened_runtime).value();
+  TEM_REQUIRE(register_facility(*runtime, "zone-p", {"zone-p/p1", "zone-p/p2"}).ok());
+
+  // One committed step of the durable workload, continuing from step to step.
+  std::uint64_t sequence = 1;
+  const auto step = [&runtime, &sequence](int index) -> Status {
+    const Timestamp now =
+        base_time().checked_add(Duration::from_seconds(10 * (index + 1))).value_or(base_time());
+    for (const std::string& probe : {"zone-p/p1", "zone-p/p2"}) {
+      auto admitted = runtime->AdmitSample(
+          runtime->Authority(), make_sample("zone-p", probe, 22'000 + index * 1'000, now, sequence++));
+      if (!admitted.ok()) {
+        return admitted.status();
+      }
+    }
+    auto report = runtime->Tick(runtime->Authority(), now);
+    return report.ok() ? Status::success() : report.status();
+  };
+  // Both slot files exist after the first steps.
+  TEM_REQUIRE(step(0).ok());
+  TEM_REQUIRE(step(1).ok());
+  TEM_REQUIRE(std::filesystem::exists(slot_path(dir.path(), 0)));
+  TEM_REQUIRE(std::filesystem::exists(slot_path(dir.path(), 1)));
+  const std::uint64_t commits_before = runtime->Stats().commits;
+
+  // A reader has the slot files open for a moment (an inspection, a backup, a
+  // scan) while the next commit replaces one of them.
+  std::ifstream reader_a(slot_path(dir.path(), 0), std::ios::binary);
+  std::ifstream reader_b(slot_path(dir.path(), 1), std::ios::binary);
+  const bool readers_open = static_cast<bool>(reader_a) && static_cast<bool>(reader_b);
+  std::thread release([&reader_a, &reader_b] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    reader_a.close();
+    reader_b.close();
+  });
+  const Status during = step(2);
+  release.join();
+  TEM_REQUIRE(readers_open);
+  // The commit waited for the reader instead of failing, and the runtime is
+  // still in service: it used to stop accepting work after the failed commit.
+  TEM_CHECK(during.ok());
+  TEM_CHECK(step(3).ok());
+  TEM_CHECK(runtime->Stats().commits > commits_before);
+  TEM_CHECK(runtime->VerifyStore().ok);
+  runtime->Shutdown();
+  runtime.reset();
+
+  auto reopened = open_durable(dir.path(), 2, 2);
+  TEM_REQUIRE(reopened.ok());
+  auto replayed = reopened.value()->VerifyReplay();
+  TEM_REQUIRE(replayed.ok());
+  TEM_CHECK(replayed.value().verified);
   reopened.value()->Shutdown();
 }
 

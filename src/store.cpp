@@ -215,11 +215,29 @@ Status write_file_durable(const std::filesystem::path& path,
 Status atomic_replace(const std::filesystem::path& staged,
                       const std::filesystem::path& target) {
 #ifdef _WIN32
-  if (::MoveFileExW(staged.c_str(), target.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
-    return io_error("cannot publish the staged slot", target, last_error_code());
+  // While a reader has the target open (an inspection, a backup, an antivirus or
+  // indexing scan) the replace fails until the reader closes it, so it is
+  // retried for a bounded time (about 2 s). A directory or a read-only file in
+  // the way is not transient and fails at once.
+  for (int attempt = 0;; ++attempt) {
+    if (::MoveFileExW(staged.c_str(), target.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+      return Status::success();
+    }
+    const DWORD error = ::GetLastError();
+    const DWORD attributes = ::GetFileAttributesW(target.c_str());
+    const bool blocked =
+        attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) != 0;
+    const bool transient = (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION ||
+                            error == ERROR_LOCK_VIOLATION) &&
+                           !blocked;
+    if (!transient || attempt >= 100) {
+      return io_error("cannot publish the staged slot", target,
+                      static_cast<std::uint32_t>(error));
+    }
+    ::Sleep(20);
   }
-  return Status::success();
 #else
   if (::rename(staged.c_str(), target.c_str()) != 0) {
     return io_error("cannot publish the staged slot", target, last_error_code());
